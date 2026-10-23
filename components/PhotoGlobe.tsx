@@ -18,7 +18,7 @@ const GOLDEN = Math.PI * (3 - Math.sqrt(5));
 //   false (option A) = one tile per photo; the sphere grows as guests post.
 //   true  (option B) = the sphere is always full: real photos are spread around and repeated to fill the gaps.
 // You can compare both on the same site: open  /  for the default and  /?fill=1  or  /?fill=0  to force one.
-const DEFAULT_FILL = false;
+const DEFAULT_FILL = true;
 
 // Order in which real photos claim tiles in option B. Ranking a golden-ratio sequence
 // spreads the first few photos evenly over the whole sphere instead of bunching them in one spot.
