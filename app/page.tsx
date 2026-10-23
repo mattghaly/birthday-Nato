@@ -145,7 +145,7 @@ export default function Dashboard() {
         <span className="text-[14vh] leading-none">{AGE}</span>
       </div>
 
-      <section className="absolute right-0 top-0 h-[68vh] w-[68vw] p-[1.2vw]">
+      <section className="absolute left-[25vw] top-[8vh] h-[84vh] w-[70vw] p-[1.2vw]">
         {photos.length === 0 && (
           <p className="absolute inset-0 flex items-center justify-center text-center text-[6vh] text-neutral-500">
             Scan the code to add the first photo
