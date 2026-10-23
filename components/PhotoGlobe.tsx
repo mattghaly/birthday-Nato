@@ -60,7 +60,6 @@ export default function PhotoGlobe({ photos }: { photos: GlobePhoto[] }) {
   const tgt = useRef(new Float64Array(SLOTS * 3));
   const count = useRef(0);
   const tileNow = useRef(0);
-  const fullK = useRef(0); // 0 -> 1 once the sphere holds all SLOTS photos: then it also tumbles so every side is shown
 
   const rot = useRef<M>(identity());
   const pending = useRef({ yaw: 0, pitch: 0 }); // rotation still "owed" to the globe: it follows softly
@@ -233,11 +232,8 @@ export default function PhotoGlobe({ photos }: { photos: GlobePhoto[] }) {
       const f = 1 - Math.exp(-dt * 6);
       const dy = p.yaw * f, dp = p.pitch * f;
       p.yaw -= dy; p.pitch -= dp;
-      fullK.current += ((n >= SLOTS ? 1 : 0) - fullK.current) * (1 - Math.exp(-dt * 0.8));
-      const a = reduced() ? 0 : auto.current.k * dt;
-      const spin = a * (0.16 + 0.07 * fullK.current); // turns a little faster when full
-      const tumble = a * fullK.current * 0.12 * Math.sin(t * 0.12); // slowly tips the poles toward you
-      rot.current = mul(mul(rotX(dp + tumble), rotY(dy + spin)), rot.current);
+      const spin = reduced() ? 0 : auto.current.k * 0.16 * dt;
+      rot.current = mul(mul(rotX(dp), rotY(dy + spin)), rot.current);
       if (Math.round(t * 60) % 600 === 0) rot.current = clean(rot.current);
 
       const m = rot.current;
