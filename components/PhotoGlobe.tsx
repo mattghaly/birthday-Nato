@@ -14,6 +14,20 @@ const BASE_SHADOW = "0 0 0 0px rgba(245,158,11,0), 0 4px 14px rgba(0,0,0,.3)";
 const GLOW_SHADOW = "0 0 0 8px rgba(245,158,11,1), 0 4px 40px rgba(245,158,11,.9)";
 const GOLDEN = Math.PI * (3 - Math.sqrt(5));
 
+// Look of the globe while there are few photos:
+//   false (option A) = one tile per photo; the sphere grows as guests post.
+//   true  (option B) = the sphere is always full: real photos are spread around and repeated to fill the gaps.
+// You can compare both on the same site: open  /  for the default and  /?fill=1  or  /?fill=0  to force one.
+const DEFAULT_FILL = false;
+
+// Order in which real photos claim tiles in option B. Ranking a golden-ratio sequence
+// spreads the first few photos evenly over the whole sphere instead of bunching them in one spot.
+const SPREAD = (() => {
+  const v = Array.from({ length: SLOTS }, (_, k) => (k * 0.6180339887) % 1);
+  const sorted = [...v].sort((a, b) => a - b);
+  return v.map((x) => sorted.indexOf(x));
+})();
+
 // ---- tiny 3x3 rotation-matrix helpers (row-major) ----
 type M = number[];
 const identity = (): M => [1, 0, 0, 0, 1, 0, 0, 0, 1];
@@ -53,6 +67,9 @@ export default function PhotoGlobe({ photos }: { photos: GlobePhoto[] }) {
   const addedAt = useRef<number[]>(Array(SLOTS).fill(0));
   const freshSlots = useRef<number[]>([]);
   const intro = useRef(false);
+  const fill = useRef(DEFAULT_FILL); // option A / B
+  const realCount = useRef(0); // option B: how many different photos already have their own tile
+  const introSlot = useRef(0);
 
   // Where each tile sits on the unit sphere now (cur) and where it is heading (tgt).
   // When a photo is added every tile glides to its new spot, so the sphere re-spaces smoothly.
@@ -95,6 +112,13 @@ export default function PhotoGlobe({ photos }: { photos: GlobePhoto[] }) {
     count.current = n;
   };
 
+  // Pick option A or B from the address (?fill=1 / ?fill=0), otherwise the default above.
+  useEffect(() => {
+    const q = new URLSearchParams(window.location.search).get("fill");
+    if (q === "1") fill.current = true;
+    if (q === "0") fill.current = false;
+  }, []);
+
   // Measure the area the globe lives in.
   useEffect(() => {
     const el = box.current;
@@ -115,9 +139,22 @@ export default function PhotoGlobe({ photos }: { photos: GlobePhoto[] }) {
     if (prev.length === 0) {
       photos.forEach((p) => known.current.add(p.id));
       const first = photos.slice(0, SLOTS); // newest first
-      layoutTo(first.length);
       intro.current = true;
-      commit(first);
+      if (fill.current) {
+        // Option B: the sphere is full from the start. Real photos are spread around, repeats fill the rest.
+        const tilesB: GlobePhoto[] = new Array(SLOTS);
+        for (let k = 0; k < first.length; k++) tilesB[SPREAD[k]] = first[k];
+        let j = 0;
+        for (let s = 0; s < SLOTS; s++) if (!tilesB[s]) tilesB[s] = first[j++ % first.length];
+        realCount.current = first.length;
+        introSlot.current = SPREAD[0];
+        layoutTo(SLOTS);
+        commit(tilesB);
+      } else {
+        introSlot.current = 0;
+        layoutTo(first.length);
+        commit(first);
+      }
       return;
     }
 
@@ -126,7 +163,11 @@ export default function PhotoGlobe({ photos }: { photos: GlobePhoto[] }) {
     const next = [...prev];
     fresh.forEach((p) => {
       let slot = -1;
-      if (next.length < SLOTS) {
+      if (fill.current && realCount.current < SLOTS) {
+        // Option B: the new photo takes over one repeated tile; no other photo is touched.
+        slot = SPREAD[realCount.current++];
+        next[slot] = p;
+      } else if (!fill.current && next.length < SLOTS) {
         slot = next.length;
         next.push(p);
         layoutTo(next.length);
@@ -150,7 +191,7 @@ export default function PhotoGlobe({ photos }: { photos: GlobePhoto[] }) {
       intro.current = false;
       const all = inner.current.filter(Boolean) as HTMLElement[];
       if (!reduced()) gsap.from(all, { scale: 0, opacity: 0, duration: 0.9, ease: "back.out(1.6)", stagger: { each: 0.03, from: "random" } });
-      focus.current = { slot: 0, until: performance.now() + 3500 };
+      focus.current = { slot: introSlot.current, until: performance.now() + 3500 };
     }
     if (freshSlots.current.length) {
       const slots = freshSlots.current.splice(0);
