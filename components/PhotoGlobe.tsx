@@ -4,21 +4,15 @@ import gsap from "gsap";
 
 export type GlobePhoto = { id: number; url: string; caption: string };
 
-// How many tiles sit on the sphere. Extra photos rotate in on the hidden back side,
-// so the page stays fast with hundreds of photos.
+// Maximum tiles on the sphere. With more photos than this, extra photos swap in
+// on the hidden back side, so the page stays fast with hundreds of photos.
 const SLOTS = 56;
 const CAMERA = 3.2; // perspective strength (smaller = stronger)
+const RASTER = 1.5; // tiles are drawn this much bigger than needed and scaled down, so they stay sharp up close
+const RECENT_MS = 10000; // a just-added photo is never replaced for this long
 const BASE_SHADOW = "0 0 0 0px rgba(245,158,11,0), 0 4px 14px rgba(0,0,0,.3)";
 const GLOW_SHADOW = "0 0 0 8px rgba(245,158,11,1), 0 4px 40px rgba(245,158,11,.9)";
-
-// Evenly spread points on a unit sphere (Fibonacci lattice).
 const GOLDEN = Math.PI * (3 - Math.sqrt(5));
-const POINTS = Array.from({ length: SLOTS }, (_, i) => {
-  const y = 1 - (2 * (i + 0.5)) / SLOTS;
-  const r = Math.sqrt(1 - y * y);
-  const a = i * GOLDEN;
-  return [Math.cos(a) * r, y, Math.sin(a) * r] as const;
-});
 
 // ---- tiny 3x3 rotation-matrix helpers (row-major) ----
 type M = number[];
@@ -44,32 +38,62 @@ const clean = (m: M): M => {
 const reduced = () => typeof window !== "undefined" && window.matchMedia("(prefers-reduced-motion: reduce)").matches;
 
 export default function PhotoGlobe({ photos }: { photos: GlobePhoto[] }) {
-  const [tiles, setTiles] = useState<(GlobePhoto | null)[]>(() => Array(SLOTS).fill(null));
+  // One tile per photo (up to SLOTS). The array grows as guests post.
+  const [tiles, setTiles] = useState<GlobePhoto[]>([]);
   const [size, setSize] = useState({ w: 0, h: 0 });
 
   const box = useRef<HTMLDivElement>(null);
   const els = useRef<(HTMLDivElement | null)[]>([]);
   const inner = useRef<(HTMLElement | null)[]>([]);
 
-  const tilesRef = useRef<(GlobePhoto | null)[]>(Array(SLOTS).fill(null));
+  const tilesRef = useRef<GlobePhoto[]>([]);
   const photosRef = useRef<GlobePhoto[]>([]);
   const known = useRef<Set<number>>(new Set());
   const zs = useRef<number[]>(Array(SLOTS).fill(0));
+  const addedAt = useRef<number[]>(Array(SLOTS).fill(0));
   const freshSlots = useRef<number[]>([]);
   const intro = useRef(false);
+
+  // Where each tile sits on the unit sphere now (cur) and where it is heading (tgt).
+  // When a photo is added every tile glides to its new spot, so the sphere re-spaces smoothly.
+  const cur = useRef(new Float64Array(SLOTS * 3));
+  const tgt = useRef(new Float64Array(SLOTS * 3));
+  const count = useRef(0);
+  const tileNow = useRef(0);
+  const fullK = useRef(0); // 0 -> 1 once the sphere holds all SLOTS photos: then it also tumbles so every side is shown
 
   const rot = useRef<M>(identity());
   const pending = useRef({ yaw: 0, pitch: 0 }); // rotation still "owed" to the globe: it follows softly
   const auto = useRef({ k: 1 }); // 0 = paused, 1 = idle spin
   const focus = useRef<{ slot: number; until: number } | null>(null);
   const drag = useRef({ active: false, x: 0, y: 0, dx: 0, dy: 0, t: 0 });
-  const layout = useRef({ R: 200 });
 
   const R = Math.min(size.w, size.h) * 0.5 * 0.74;
-  const tileW = Math.max(40, Math.sqrt((4 * Math.PI * R * R) / SLOTS) * 0.84);
+  const domW = Math.max(60, R * 0.62 * RASTER);
+  const layout = useRef({ R: 200, domW: 200 });
   layout.current.R = R;
+  layout.current.domW = domW;
 
-  const commit = (next: (GlobePhoto | null)[]) => { tilesRef.current = next; setTiles(next); };
+  const commit = (next: GlobePhoto[]) => { tilesRef.current = next; setTiles(next); };
+
+  // Spread n points evenly over the sphere (Fibonacci lattice). New tiles start at their final spot.
+  const layoutTo = (n: number) => {
+    const old = count.current;
+    for (let i = 0; i < n; i++) {
+      const y = 1 - (2 * (i + 0.5)) / n;
+      const r = Math.sqrt(Math.max(0, 1 - y * y));
+      const a = i * GOLDEN;
+      tgt.current[i * 3] = Math.cos(a) * r;
+      tgt.current[i * 3 + 1] = y;
+      tgt.current[i * 3 + 2] = Math.sin(a) * r;
+      if (i >= old) {
+        cur.current[i * 3] = tgt.current[i * 3];
+        cur.current[i * 3 + 1] = tgt.current[i * 3 + 1];
+        cur.current[i * 3 + 2] = tgt.current[i * 3 + 2];
+      }
+    }
+    count.current = n;
+  };
 
   // Measure the area the globe lives in.
   useEffect(() => {
@@ -80,27 +104,42 @@ export default function PhotoGlobe({ photos }: { photos: GlobePhoto[] }) {
     return () => ro.disconnect();
   }, []);
 
-  // Put photos on the sphere; brand-new photos replace the tile facing you and the globe turns to show it.
+  // Photos -> tiles. Every new photo gets its OWN tile; once the sphere is full it replaces an older tile
+  // (never one that was just added), and the globe turns to show it.
   useEffect(() => {
     photosRef.current = photos;
     if (!photos.length) return;
     const prev = tilesRef.current;
-    if (prev.every((t) => t === null)) {
+    const now = performance.now();
+
+    if (prev.length === 0) {
       photos.forEach((p) => known.current.add(p.id));
+      const first = photos.slice(0, SLOTS); // newest first
+      layoutTo(first.length);
       intro.current = true;
-      commit(Array.from({ length: SLOTS }, (_, i) => photos[i % photos.length]));
+      commit(first);
       return;
     }
-    const fresh = photos.filter((p) => !known.current.has(p.id)).reverse();
+
+    const fresh = photos.filter((p) => !known.current.has(p.id)).reverse(); // oldest first
     if (!fresh.length) return;
     const next = [...prev];
-    const taken = new Set<number>();
     fresh.forEach((p) => {
+      let slot = -1;
+      if (next.length < SLOTS) {
+        slot = next.length;
+        next.push(p);
+        layoutTo(next.length);
+      } else {
+        let bz = -9;
+        for (let i = 0; i < SLOTS; i++)
+          if (now - addedAt.current[i] > RECENT_MS && zs.current[i] > bz) { bz = zs.current[i]; slot = i; }
+        if (slot < 0) return; // everything is brand new: this photo waits for the back-swap below
+        next[slot] = p;
+      }
       known.current.add(p.id);
-      let best = -1, bz = -9;
-      for (let i = 0; i < SLOTS; i++) if (!taken.has(i) && zs.current[i] > bz) { bz = zs.current[i]; best = i; }
-      if (best < 0) return;
-      next[best] = p; taken.add(best); freshSlots.current.push(best);
+      addedAt.current[slot] = now;
+      freshSlots.current.push(slot);
     });
     commit(next);
   }, [photos]);
@@ -110,13 +149,15 @@ export default function PhotoGlobe({ photos }: { photos: GlobePhoto[] }) {
     if (intro.current) {
       intro.current = false;
       const all = inner.current.filter(Boolean) as HTMLElement[];
-      if (!reduced()) gsap.from(all, { scale: 0, opacity: 0, duration: 0.9, ease: "back.out(1.6)", stagger: { each: 0.018, from: "random" } });
+      if (!reduced()) gsap.from(all, { scale: 0, opacity: 0, duration: 0.9, ease: "back.out(1.6)", stagger: { each: 0.03, from: "random" } });
+      focus.current = { slot: 0, until: performance.now() + 3500 };
     }
     if (freshSlots.current.length) {
       const slots = freshSlots.current.splice(0);
       slots.forEach((slot) => {
         const el = inner.current[slot];
         if (!el || reduced()) return;
+        gsap.killTweensOf(el);
         gsap.timeline()
           .fromTo(el, { scale: 0.1, rotation: -30, boxShadow: GLOW_SHADOW }, { scale: 1.35, rotation: 0, boxShadow: GLOW_SHADOW, duration: 1.2, ease: "elastic.out(1, 0.6)" })
           .to(el, { scale: 1, boxShadow: BASE_SHADOW, duration: 0.9, ease: "power2.inOut" }, "+=2.6");
@@ -130,15 +171,18 @@ export default function PhotoGlobe({ photos }: { photos: GlobePhoto[] }) {
   useEffect(() => {
     const id = setInterval(() => {
       const ps = photosRef.current;
-      if (ps.length <= SLOTS) return;
-      const shown = new Set(tilesRef.current.map((t) => t?.id));
+      if (tilesRef.current.length < SLOTS || ps.length <= SLOTS) return;
+      const shown = new Set(tilesRef.current.map((t) => t.id));
       const pool = ps.filter((p) => !shown.has(p.id));
       if (!pool.length) return;
+      const now = performance.now();
       let slot = -1, lo = -0.35;
-      for (let i = 0; i < SLOTS; i++) if (zs.current[i] < lo) { lo = zs.current[i]; slot = i; }
+      for (let i = 0; i < SLOTS; i++)
+        if (now - addedAt.current[i] > RECENT_MS && zs.current[i] < lo) { lo = zs.current[i]; slot = i; }
       if (slot < 0) return;
       const next = [...tilesRef.current];
       next[slot] = pool[Math.floor(Math.random() * pool.length)];
+      known.current.add(next[slot].id);
       commit(next);
     }, 1800);
     return () => clearInterval(id);
@@ -154,41 +198,63 @@ export default function PhotoGlobe({ photos }: { photos: GlobePhoto[] }) {
     const tick = (t: number, deltaMs: number) => {
       const dt = Math.min(0.05, deltaMs / 1000);
       const p = pending.current;
+      const L = layout.current;
+      const n = count.current;
+      const c = cur.current, g = tgt.current;
+
+      // Tiles glide toward their (re-spaced) positions.
+      const glide = 1 - Math.exp(-dt * 2.5);
+      for (let i = 0; i < n; i++) {
+        const x = c[i * 3] + (g[i * 3] - c[i * 3]) * glide;
+        const y = c[i * 3 + 1] + (g[i * 3 + 1] - c[i * 3 + 1]) * glide;
+        const z = c[i * 3 + 2] + (g[i * 3 + 2] - c[i * 3 + 2]) * glide;
+        const l = Math.hypot(x, y, z) || 1;
+        c[i * 3] = x / l; c[i * 3 + 1] = y / l; c[i * 3 + 2] = z / l;
+      }
+
+      // Tile size: big when there are few photos, smaller as the sphere fills up.
+      const want = Math.min(L.R * 0.62, Math.sqrt((4 * Math.PI * L.R * L.R) / Math.max(n, 12)) * 0.84);
+      tileNow.current = tileNow.current === 0 ? want : tileNow.current + (want - tileNow.current) * (1 - Math.exp(-dt * 3));
+      const mult = tileNow.current / L.domW;
 
       // Closed loop "turn to this photo": always measures what is still missing.
       const fo = focus.current;
-      if (fo) {
-        const m = rot.current, q = POINTS[fo.slot];
-        const x = m[0] * q[0] + m[1] * q[1] + m[2] * q[2];
-        const y = m[3] * q[0] + m[4] * q[1] + m[5] * q[2];
-        const z = m[6] * q[0] + m[7] * q[1] + m[8] * q[2];
+      if (fo && fo.slot < n) {
+        const m = rot.current;
+        const qx = c[fo.slot * 3], qy = c[fo.slot * 3 + 1], qz = c[fo.slot * 3 + 2];
+        const x = m[0] * qx + m[1] * qy + m[2] * qz;
+        const y = m[3] * qx + m[4] * qy + m[5] * qz;
+        const z = m[6] * qx + m[7] * qy + m[8] * qz;
         p.yaw = Math.atan2(-x, z);
         p.pitch = Math.atan2(y, Math.hypot(x, z));
         if (Math.abs(p.yaw) + Math.abs(p.pitch) < 0.015 || performance.now() > fo.until) focus.current = null;
-      }
+      } else if (fo) focus.current = null;
 
       const f = 1 - Math.exp(-dt * 6);
       const dy = p.yaw * f, dp = p.pitch * f;
       p.yaw -= dy; p.pitch -= dp;
-      const spin = reduced() ? 0 : auto.current.k * 0.16 * dt;
-      rot.current = mul(mul(rotX(dp), rotY(dy + spin)), rot.current);
+      fullK.current += ((n >= SLOTS ? 1 : 0) - fullK.current) * (1 - Math.exp(-dt * 0.8));
+      const a = reduced() ? 0 : auto.current.k * dt;
+      const spin = a * (0.16 + 0.07 * fullK.current); // turns a little faster when full
+      const tumble = a * fullK.current * 0.12 * Math.sin(t * 0.12); // slowly tips the poles toward you
+      rot.current = mul(mul(rotX(dp + tumble), rotY(dy + spin)), rot.current);
       if (Math.round(t * 60) % 600 === 0) rot.current = clean(rot.current);
 
       const m = rot.current;
-      const Rr = layout.current.R * (1 + Math.sin(t * 0.8) * 0.012);
-      for (let i = 0; i < SLOTS; i++) {
-        const el = els.current[i];
-        const q = POINTS[i];
-        const x = m[0] * q[0] + m[1] * q[1] + m[2] * q[2];
-        const y = m[3] * q[0] + m[4] * q[1] + m[5] * q[2];
-        const z = m[6] * q[0] + m[7] * q[1] + m[8] * q[2];
+      const Rr = L.R * (1 + Math.sin(t * 0.8) * 0.012);
+      for (let i = 0; i < n; i++) {
+        const qx = c[i * 3], qy = c[i * 3 + 1], qz = c[i * 3 + 2];
+        const x = m[0] * qx + m[1] * qy + m[2] * qz;
+        const y = m[3] * qx + m[4] * qy + m[5] * qz;
+        const z = m[6] * qx + m[7] * qy + m[8] * qz;
         zs.current[i] = z;
+        const el = els.current[i];
         if (!el) continue;
         const persp = CAMERA / (CAMERA - z);
         const bob = reduced() ? 0 : Math.sin(t * 0.9 + i * 1.7) * 5;
         const sway = reduced() ? 0 : Math.sin(t * 0.6 + i * 2.3) * 3;
         const vis = Math.min(1, Math.max(0, (z + 0.85) / 1.1));
-        el.style.transform = `translate3d(${(x * Rr * persp).toFixed(2)}px,${(y * Rr * persp + bob).toFixed(2)}px,0) rotate(${sway.toFixed(2)}deg) scale(${persp.toFixed(3)})`;
+        el.style.transform = `translate3d(${(x * Rr * persp).toFixed(2)}px,${(y * Rr * persp + bob).toFixed(2)}px,0) rotate(${sway.toFixed(2)}deg) scale(${(persp * mult).toFixed(4)})`;
         el.style.opacity = String(0.25 + 0.75 * vis);
         el.style.zIndex = String(Math.round((z + 1) * 500));
       }
@@ -204,9 +270,9 @@ export default function PhotoGlobe({ photos }: { photos: GlobePhoto[] }) {
     const onWheel = (e: WheelEvent) => {
       e.preventDefault();
       focus.current = null;
-      const c = (v: number) => Math.max(-2.5, Math.min(2.5, v));
-      pending.current.yaw = c(pending.current.yaw + e.deltaY * 0.0035);
-      pending.current.pitch = c(pending.current.pitch - e.deltaX * 0.0035);
+      const cl = (v: number) => Math.max(-2.5, Math.min(2.5, v));
+      pending.current.yaw = cl(pending.current.yaw + e.deltaY * 0.0035);
+      pending.current.pitch = cl(pending.current.pitch - e.deltaX * 0.0035);
       pauseAuto(2.5);
     };
     el.addEventListener("wheel", onWheel, { passive: false });
@@ -242,24 +308,22 @@ export default function PhotoGlobe({ photos }: { photos: GlobePhoto[] }) {
   return (
     <div ref={box} className="relative h-full w-full cursor-grab touch-none select-none active:cursor-grabbing"
       onPointerDown={down} onPointerMove={move} onPointerUp={up} onPointerCancel={up}>
-      {tiles.map((p, i) =>
-        p ? (
-          <div key={i} ref={(el) => { els.current[i] = el; }}
-            className="pointer-events-none absolute left-1/2 top-1/2 will-change-transform"
-            style={{ width: tileW, marginLeft: -tileW / 2, marginTop: -tileW * 0.58, opacity: 0 }}>
-            <figure ref={(el) => { inner.current[i] = el; }} className="m-0 bg-white"
-              style={{ padding: `${tileW * 0.05}px ${tileW * 0.05}px 0`, border: "1px solid #d4d4d4", boxShadow: BASE_SHADOW }}>
-              {/* eslint-disable-next-line @next/next/no-img-element */}
-              <img src={p.url} alt={p.caption} draggable={false} decoding="async"
-                style={{ width: "100%", aspectRatio: "1 / 1", objectFit: "cover", display: "block" }} />
-              <figcaption className="flex items-center justify-center overflow-hidden text-center font-bold"
-                style={{ height: tileW * 0.2, fontSize: tileW * 0.085, lineHeight: 1.05 }}>
-                <span className="line-clamp-2 px-0.5">{p.caption}</span>
-              </figcaption>
-            </figure>
-          </div>
-        ) : null
-      )}
+      {tiles.map((p, i) => (
+        <div key={i} ref={(el) => { els.current[i] = el; }}
+          className="pointer-events-none absolute left-1/2 top-1/2 will-change-transform"
+          style={{ width: domW, marginLeft: -domW / 2, marginTop: -domW * 0.58, opacity: 0 }}>
+          <figure ref={(el) => { inner.current[i] = el; }} className="m-0 bg-white"
+            style={{ padding: `${domW * 0.05}px ${domW * 0.05}px 0`, border: "1px solid #d4d4d4", boxShadow: BASE_SHADOW }}>
+            {/* eslint-disable-next-line @next/next/no-img-element */}
+            <img src={p.url} alt={p.caption} draggable={false} decoding="async"
+              style={{ width: "100%", aspectRatio: "1 / 1", objectFit: "cover", display: "block" }} />
+            <figcaption className="flex items-center justify-center overflow-hidden text-center font-bold"
+              style={{ height: domW * 0.2, fontSize: domW * 0.085, lineHeight: 1.05 }}>
+              <span className="line-clamp-2 px-0.5">{p.caption}</span>
+            </figcaption>
+          </figure>
+        </div>
+      ))}
     </div>
   );
 }
